@@ -1,45 +1,18 @@
 import asyncio
 import json
-from contextlib import redirect_stdout
-from io import StringIO
-from typing import Any, Callable, TypedDict
+from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolUnionParam
 
+from task import PROMPT, TOOL_HANDLERS, TOOLS, grading_func, reset_task_state
 
-class PythonExpressionToolResult(TypedDict):
-    result: Any
-    error: str | None
-
-
-class SubmitAnswerToolResult(TypedDict):
-    answer: Any
-    submitted: bool
-
-
-def python_expression_tool(expression: str) -> PythonExpressionToolResult:
-    """
-    Tool that evaluates Python expressions using exec.
-    Use print(...) to emit output; stdout will be captured and returned.
-    """
-    try:
-        namespace = {}
-        stdout = StringIO()
-        with redirect_stdout(stdout):
-            exec(expression, namespace, namespace)
-        return {"result": stdout.getvalue(), "error": None}
-    except KeyboardInterrupt:
-        raise
-    except Exception as e:
-        return {"result": None, "error": str(e)}
-
-
-def submit_answer_tool(answer: Any) -> SubmitAnswerToolResult:
-    """
-    Tool for submitting the final answer.
-    """
-    return {"answer": answer, "submitted": True}
+MAX_TOKENS = 5000
+LOGS_DIR = Path("logs")
+LOGS_DIR.mkdir(exist_ok=True)
 
 
 async def run_agent_loop(
@@ -47,113 +20,184 @@ async def run_agent_loop(
     tools: list[ToolUnionParam],
     tool_handlers: dict[str, Callable[..., Any]],
     max_steps: int = 20,
-    model: str = "claude-3-5-haiku-latest",
+    model: str = "claude-haiku-4-5",
     verbose: bool = True,
+    log_file: Path | None = None,
 ) -> Any | None:
-    """
-    Runs an agent loop with the given prompt and tools.
-
-    Args:
-        prompt: The initial prompt for the agent
-        tools: List of tool definitions for Anthropic API
-        tool_handlers: Dictionary mapping tool names to their handler functions
-        max_steps: Maximum number of steps before stopping (default 5)
-        model: The Anthropic model to use
-        verbose: Whether to print detailed output (default True)
-
-    Returns:
-        The submitted answer if submit_answer was called, otherwise None
-    """
+    """Runs an agent loop with the given prompt and tools."""
     client = AsyncAnthropic()
     messages: list[MessageParam] = [{"role": "user", "content": prompt}]
 
+    log_data = {
+        "timestamp": datetime.now().isoformat(),
+        "model": model,
+        "max_steps": max_steps,
+        "initial_prompt": prompt,
+        "steps": [],
+        "final_result": None,
+        "completion_status": None,
+    }
+
     for step in range(max_steps):
         if verbose:
-            print(f"\n=== Step {step + 1}/{max_steps} ===")
+            print(f"\n{'='*60}\n⚡ Step {step + 1}/{max_steps}\n{'='*60}")
 
         response = await client.messages.create(
-            model=model, max_tokens=1000, tools=tools, messages=messages
+            model=model, max_tokens=MAX_TOKENS, tools=tools, messages=messages
         )
 
-        # Track if we need to continue
+        step_log = {
+            "step_number": step + 1,
+            "api_response": {
+                "id": response.id,
+                "stop_reason": response.stop_reason,
+                "usage": {
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                },
+            },
+            "tool_calls": [],
+        }
+
+        if response.stop_reason == "max_tokens":
+            print(f"Model reached max_tokens limit {MAX_TOKENS}")
+
         has_tool_use = False
         tool_results = []
         submitted_answer = None
 
-        # Process the response
         for content in response.content:
             if content.type == "text":
                 if verbose:
-                    print(f"Assistant: {content.text}")
+                    print(f"\n💭 Assistant: {content.text}")
+                step_log["tool_calls"].append({"type": "text", "content": content.text})
+
             elif content.type == "tool_use":
                 has_tool_use = True
                 tool_name = content.name
+                tool_input = content.input
+
+                tool_call_log = {
+                    "tool_name": tool_name,
+                    "tool_use_id": content.id,
+                    "input": tool_input,
+                    "output": None,
+                }
 
                 if tool_name in tool_handlers:
                     if verbose:
-                        print(f"Using tool: {tool_name}")
+                        print(f"\n🔧 Tool: {tool_name}")
+                        if tool_name == "python_expression":
+                            print(f"📥 Input:\n```python\n{tool_input['expression']}\n```")
+                        else:
+                            print(f"📥 Input: {tool_input}")
 
-                    # Extract arguments based on tool
                     handler = tool_handlers[tool_name]
-                    tool_input = content.input
 
-                    # Call the appropriate tool handler
+                    # Call handler with appropriate arguments
                     if tool_name == "python_expression":
-                        assert (
-                            isinstance(tool_input, dict) and "expression" in tool_input
-                        )
-                        if verbose:
-                            print("\nInput:")
-                            print("```")
-                            for line in tool_input["expression"].split("\n"):
-                                print(f"{line}")
-                            print("```")
                         result = handler(tool_input["expression"])
-                        if verbose:
-                            print("\nOutput:")
-                            print("```")
-                            print(result)
-                            print("```")
-                    elif tool_name == "submit_answer":
-                        assert isinstance(tool_input, dict) and "answer" in tool_input
-                        result = handler(tool_input["answer"])
-                        submitted_answer = result["answer"]
+                    elif tool_name == "submit_predictions":
+                        result = handler(predictions_file=tool_input.get("predictions_file", ""))
+                        submitted_answer = result
                     else:
-                        # Generic handler call
-                        result = (
-                            handler(**tool_input)
-                            if isinstance(tool_input, dict)
-                            else handler(tool_input)
-                        )
+                        result = handler(**tool_input) if isinstance(tool_input, dict) else handler(tool_input)
 
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": content.id,
-                            "content": json.dumps(result),
-                        }
-                    )
+                    if verbose:
+                        print(f"📤 Output: {result}")
 
-        # If we have tool uses, add them to the conversation
+                    tool_call_log["output"] = result
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": content.id,
+                        "content": json.dumps(result),
+                    })
+
+                step_log["tool_calls"].append(tool_call_log)
+
+        log_data["steps"].append(step_log)
+
         if has_tool_use:
             messages.append({"role": "assistant", "content": response.content})
-
             messages.append({"role": "user", "content": tool_results})
 
-            # If an answer was submitted, return it
             if submitted_answer is not None:
                 if verbose:
-                    print(f"\nAgent submitted answer: {submitted_answer}")
+                    print(f"\n✅ Agent submitted answer!")
+                log_data["final_result"] = submitted_answer
+                log_data["completion_status"] = "submitted"
+                if log_file:
+                    _write_markdown_log(log_file, log_data)
                 return submitted_answer
         else:
-            # No tool use, conversation might be complete
             if verbose:
-                print("\nNo tool use in response, ending loop.")
+                print("\n⚠️  No tool use in response, ending loop.")
+            log_data["completion_status"] = "no_tool_use"
             break
 
     if verbose:
-        print(f"\nReached maximum steps ({max_steps}) without submitting answer.")
+        print(f"\n⏱️  Reached maximum steps ({max_steps}) without submitting answer.")
+
+    log_data["completion_status"] = "max_steps_reached"
+    if log_file:
+        _write_markdown_log(log_file, log_data)
+
     return None
+
+
+def _write_markdown_log(log_file: Path, log_data: dict) -> None:
+    """Write log data to a Markdown file."""
+    md_file = log_file.with_suffix('.md')
+
+    with open(md_file, 'w', encoding='utf-8') as f:
+        f.write(f"# Agent Run Log\n\n")
+        f.write(f"**Timestamp:** {log_data['timestamp']}\n\n")
+        f.write(f"**Model:** {log_data['model']}\n\n")
+        f.write(f"**Max Steps:** {log_data['max_steps']}\n\n")
+        f.write(f"**Completion Status:** {log_data['completion_status']}\n\n")
+        f.write(f"## Initial Prompt\n\n```\n{log_data['initial_prompt']}\n```\n\n")
+        f.write(f"## Execution Steps\n\n")
+
+        for step in log_data['steps']:
+            f.write(f"### Step {step['step_number']}\n\n")
+            f.write(f"**API Response:**\n")
+            f.write(f"- ID: `{step['api_response']['id']}`\n")
+            f.write(f"- Stop Reason: `{step['api_response']['stop_reason']}`\n")
+            f.write(f"- Input Tokens: {step['api_response']['usage']['input_tokens']}\n")
+            f.write(f"- Output Tokens: {step['api_response']['usage']['output_tokens']}\n\n")
+
+            for i, tool_call in enumerate(step['tool_calls']):
+                if tool_call.get('type') == 'text':
+                    f.write(f"**Assistant Response:**\n\n{tool_call['content']}\n\n")
+                else:
+                    f.write(f"#### Tool Call {i + 1}: `{tool_call['tool_name']}`\n\n")
+                    f.write(f"**Input:**\n\n")
+
+                    if tool_call['tool_name'] == 'python_expression':
+                        f.write(f"```python\n{tool_call['input'].get('expression', '')}\n```\n\n")
+                    else:
+                        f.write(f"```json\n{json.dumps(tool_call['input'], indent=2)}\n```\n\n")
+
+                    f.write(f"**Output:**\n\n")
+                    if tool_call['output']:
+                        f.write(f"```json\n{json.dumps(tool_call['output'], indent=2, default=str)}\n```\n\n")
+                    else:
+                        f.write(f"```\n(no output)\n```\n\n")
+
+            f.write(f"---\n\n")
+
+        f.write(f"## Final Result\n\n")
+        if log_data['final_result']:
+            f.write(f"```json\n{json.dumps(log_data['final_result'], indent=2, default=str)}\n```\n\n")
+        else:
+            f.write(f"*No result submitted*\n\n")
+
+        if 'grading' in log_data:
+            f.write(f"## Grading\n\n")
+            f.write(f"**Success:** {log_data['grading']['success']}\n\n")
+            if log_data['grading']['result']:
+                f.write(f"**Result:**\n\n")
+                f.write(f"```json\n{json.dumps(log_data['grading']['result'], indent=2, default=str)}\n```\n\n")
 
 
 async def run_single_test(
@@ -162,112 +206,99 @@ async def run_single_test(
     prompt: str,
     tools: list[ToolUnionParam],
     tool_handlers: dict[str, Callable[..., Any]],
-    expected_answer: Any,
+    grading_func: Callable[[Any], tuple[bool, dict]],
     verbose: bool = False,
 ) -> tuple[int, bool, Any]:
+    """Run a single test iteration."""
+    reset_task_state()
+
     if verbose:
         print(f"\n\n{'=' * 20} RUN {run_id}/{num_runs} {'=' * 20}")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = LOGS_DIR / f"run_{run_id:03d}_{timestamp}.md"
 
     result = await run_agent_loop(
         prompt=prompt,
         tools=tools,
         tool_handlers=tool_handlers,
-        max_steps=5,
+        max_steps=20,
         verbose=verbose,
+        log_file=log_file,
     )
 
-    success = result == expected_answer
+    success, metrics = grading_func(result)
 
-    if success:
-        print(f"✓ Run {run_id}: SUCCESS - Got {result}")
-    else:
-        print(f"✗ Run {run_id}: FAILURE - Got {result}, expected {expected_answer}")
+    # Update log file with grading result
+    md_file = log_file.with_suffix('.md')
+    if md_file.exists():
+        with open(md_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        if '## Grading' not in content:
+            with open(md_file, 'a', encoding='utf-8') as f:
+                f.write(f"## Grading\n\n")
+                f.write(f"**Success:** {success}\n\n")
+
+                if metrics:
+                    f.write(f"**Metrics:**\n\n")
+                    f.write(f"- True Positives: {metrics.get('true_positives', 0)}\n")
+                    f.write(f"- False Positives: {metrics.get('false_positives', 0)}\n")
+                    f.write(f"- False Negatives: {metrics.get('false_negatives', 0)}\n")
+                    f.write(f"- Precision: {metrics.get('precision', 0):.4f}\n")
+                    f.write(f"- Recall: {metrics.get('recall', 0):.4f}\n")
+                    f.write(f"- F1 Score: {metrics.get('f1', 0):.4f}\n\n")
+
+                if result:
+                    f.write(f"**Result:**\n\n")
+                    f.write(f"```json\n{json.dumps(result, indent=2, default=str)}\n```\n\n")
+
+    print(f"\n{'='*60}")
+    print(f"{'✅' if success else '❌'} Run {run_id}: {'SUCCESS' if success else 'FAILURE'}")
+    print(f"{'='*60}\n")
 
     return run_id, success, result
 
 
 async def main(concurrent: bool = True):
-    tools: list[ToolUnionParam] = [
-        {
-            "name": "python_expression",
-            "description": "Evaluates a Python expression",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "Will be passed to exec(). Use print() to output something. Returns stdout. ",
-                    }
-                },
-                "required": ["expression"],
-            },
-        },
-        {
-            "name": "submit_answer",
-            "description": "Submit the final answer",
-            "input_schema": {
-                "type": "object",
-                "properties": {"answer": {"description": "The final answer to submit"}},
-                "required": ["answer"],
-            },
-        },
-    ]
-
-    tool_handlers = {
-        "python_expression": python_expression_tool,
-        "submit_answer": submit_answer_tool,
-    }
-
-    # Run the test 10 times and track success rate
+    """Run the test multiple times and track success rate."""
     num_runs = 10
-    expected_answer = 8769
-    prompt = "Calculate (2^10 + 3^5) * 7 - 100. Use the python_expression tool and then submit the answer."
 
-    execution_mode = "concurrently" if concurrent else "sequentially"
-    print(f"Running {num_runs} test iterations {execution_mode}...")
-    print("=" * 60)
+    print(f"\n{'='*60}")
+    print(f"🚀 Running {num_runs} test iterations {'concurrently' if concurrent else 'sequentially'}")
+    print(f"{'='*60}\n")
 
-    # Create all test coroutines
     tasks = [
         run_single_test(
             run_id=i + 1,
             num_runs=num_runs,
-            prompt=prompt,
-            tools=tools,
-            tool_handlers=tool_handlers,
-            expected_answer=expected_answer,
-            verbose=False,
+            prompt=PROMPT,
+            tools=TOOLS,
+            tool_handlers=TOOL_HANDLERS,
+            grading_func=grading_func,
+            verbose=True,
         )
         for i in range(num_runs)
     ]
 
-    # Run concurrently or sequentially based on the flag
     if concurrent:
-        # Process results as they complete
         results = []
         for coro in asyncio.as_completed(tasks):
-            result = await coro
-            results.append(result)
+            results.append(await coro)
     else:
-        # Run sequentially by awaiting each task in order
-        results = []
-        for task in tasks:
-            result = await task
-            results.append(result)
+        results = [await task for task in tasks]
 
-    # Count successes
-    successes = sum(1 for _, success, _ in results)
-
-    # Calculate and display pass rate
+    successes = sum(success for _, success, _ in results)
     pass_rate = (successes / num_runs) * 100
-    print(f"\n{'=' * 60}")
-    print("Test Results:")
-    print(f"  Passed: {successes}/{num_runs}")
-    print(f"  Failed: {num_runs - successes}/{num_runs}")
-    print(f"  Pass Rate: {pass_rate:.1f}%")
-    print(f"{'=' * 60}")
+
+    print(f"\n{'='*60}")
+    print("📊 Test Results Summary")
+    print(f"{'='*60}")
+    print(f"✅ Passed:    {successes}/{num_runs}")
+    print(f"❌ Failed:    {num_runs - successes}/{num_runs}")
+    print(f"📈 Pass Rate: {pass_rate:.1f}%")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
-    # Set to True for concurrent execution, False for sequential execution
-    asyncio.run(main(concurrent=True))
+    asyncio.run(main(concurrent=False))
